@@ -320,6 +320,40 @@ def get_afip() -> Afip:
     return Afip(opciones)
 
 
+def _nombre_desde_padron(data) -> str | None:
+    """Saca razón social (o apellido + nombre) de la respuesta del padrón A13."""
+    if not isinstance(data, dict):
+        return None
+    for cont in (data.get("datosGenerales"), data):
+        if not isinstance(cont, dict):
+            continue
+        razon = cont.get("razonSocial")
+        if razon:
+            return str(razon).strip()
+        ape = str(cont.get("apellido") or "").strip()
+        nom = str(cont.get("nombre") or "").strip()
+        if ape or nom:
+            return " ".join(p for p in (ape, nom) if p)
+    return None
+
+
+def nombre_receptor(doc_tipo: int | None, doc_nro: int | None) -> str | None:
+    """Nombre / razón social del receptor desde el padrón A13 de ARCA.
+
+    Solo aplica a CUIT. Devuelve None (y el PDF omite la línea) si es DNI o
+    consumidor final, si el certificado no tiene habilitado el padrón, o ante
+    cualquier error: nunca debe frenar la emisión ni la reimpresión.
+    """
+    if doc_tipo != DOC_TIPO_CUIT or not doc_nro:
+        return None
+    try:
+        data = get_afip().RegisterScopeThirteen.getTaxpayerDetails(int(doc_nro))
+        return _nombre_desde_padron(data)
+    except Exception as e:
+        logger.info("Padrón no disponible para CUIT %s (%s): el PDF sale sin nombre.", doc_nro, e)
+        return None
+
+
 def emitir_factura_c(importe_total: float, doc_tipo: int, doc_nro: int,
                      cond_iva: int, fecha: date,
                      serv_desde: date | None = None,
@@ -562,6 +596,53 @@ def recordar_email_cliente(doc_tipo: int, doc_nro: int, cond_iva: int, email: st
         return False
 
 
+def nombre_de_cliente(doc_tipo: int | None, doc_nro: int | None) -> str | None:
+    """Nombre / razón social cargado a mano para ese documento.
+
+    Ignora el placeholder (que es el propio documento formateado): eso NO es
+    un nombre real, solo el relleno que se pone al crear el cliente.
+    """
+    if supabase is None or doc_tipo not in (DOC_TIPO_CUIT, DOC_TIPO_DNI):
+        return None
+    try:
+        res = (supabase.table("clientes").select("nombre")
+               .eq("doc_tipo", doc_tipo).eq("doc_nro", doc_nro)
+               .not_.is_("nombre", "null").limit(1).execute())
+        if not res.data:
+            return None
+        nombre = (res.data[0].get("nombre") or "").strip()
+        if not nombre or nombre == fmt_doc(doc_tipo, doc_nro):
+            return None
+        return nombre
+    except Exception as e:
+        logger.error("No pude buscar el nombre del cliente: %s", e)
+        return None
+
+
+def recordar_nombre_cliente(doc_tipo: int, doc_nro: int, cond_iva: int, nombre: str) -> bool:
+    """Guarda/actualiza el nombre en `clientes` para reusarlo en el PDF."""
+    if supabase is None or doc_tipo not in (DOC_TIPO_CUIT, DOC_TIPO_DNI):
+        return False
+    try:
+        existente = (supabase.table("clientes").select("id")
+                     .eq("doc_tipo", doc_tipo).eq("doc_nro", doc_nro)
+                     .limit(1).execute())
+        if existente.data:
+            (supabase.table("clientes").update({"nombre": nombre})
+             .eq("id", existente.data[0]["id"]).execute())
+        else:
+            supabase.table("clientes").insert({
+                "nombre": nombre,
+                "doc_tipo": doc_tipo,
+                "doc_nro": doc_nro,
+                "condicion_iva_receptor": cond_iva,
+            }).execute()
+        return True
+    except Exception as e:
+        logger.error("No pude recordar el nombre del cliente: %s", e)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Consultas / reportes
 # ---------------------------------------------------------------------------
@@ -764,6 +845,21 @@ def _html_factura(res: dict, ud: dict) -> str:
         receptor_doc = "-"
         receptor_cond = "Consumidor Final"
 
+    # Nombre del destinatario: ARCA no lo devuelve en la Factura C. Prioridad:
+    #   1) el tipeado en esta factura  2) el guardado a mano para el cliente
+    #   3) el padrón (si el certificado lo tiene habilitado)
+    # Si nada da resultado (DNI/CF, sin guardar, padrón no habilitado) se omite.
+    receptor_nombre = (
+        ud.get("receptor_nombre")
+        or nombre_de_cliente(ud.get("doc_tipo"), ud.get("doc_nro"))
+        or nombre_receptor(ud.get("doc_tipo"), ud.get("doc_nro"))
+    )
+    linea_nombre = (
+        f'<div class="fila"><b>Apellido y Nombre / Razón Social:</b> '
+        f'{receptor_nombre}</div>'
+        if receptor_nombre else ""
+    )
+
     total = fmt_ars(ud["monto"])
     descripcion = ud.get("descripcion") or FACTURA_DESCRIPCION
 
@@ -827,6 +923,7 @@ def _html_factura(res: dict, ud: dict) -> str:
   </div>
   {bloque_periodo}
   <div class="bloque">
+    {linea_nombre}
     <div class="fila"><b>CUIT / DNI:</b> {receptor_doc}
       &nbsp;&nbsp;<b>Condición frente al IVA:</b> {receptor_cond}</div>
   </div>

@@ -60,7 +60,8 @@ MI_CHAT_ID = int(os.environ["MI_CHAT_ID"]) if os.environ.get("MI_CHAT_ID") else 
 # Estados de la conversacion
 (ELIGIENDO_RECEPTOR, PIDIENDO_CUIT, ELIGIENDO_COND_IVA,
  PIDIENDO_MONTO, CONFIRMANDO, PIDIENDO_FECHA, PIDIENDO_PERIODO,
- CONFIRMANDO_LOTE, CONFIRMANDO_NC) = range(9)
+ CONFIRMANDO_LOTE, CONFIRMANDO_NC, PIDIENDO_DESCRIPCION,
+ PIDIENDO_NOMBRE) = range(11)
 
 LOTE_MAX = 10                  # tope de facturas por /lote, contra el fat-finger
 
@@ -113,6 +114,11 @@ async def mostrar_preview(mensaje, ud: dict) -> int:
     fila_extras = [InlineKeyboardButton("📅 Fecha", callback_data="fecha")]
     if fac.USA_PERIODO:
         fila_extras.append(InlineKeyboardButton("📆 Período", callback_data="periodo"))
+    fila_extras.append(InlineKeyboardButton("📝 Detalle", callback_data="detalle"))
+    # El nombre del receptor solo aplica a CUIT/DNI (a consumidor final no).
+    receptor_identificado = ud.get("doc_tipo") in (fac.DOC_TIPO_CUIT, fac.DOC_TIPO_DNI)
+    if receptor_identificado:
+        fila_extras.append(InlineKeyboardButton("✏️ Nombre", callback_data="nombre"))
     botones = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Confirmar", callback_data="confirmar"),
@@ -120,13 +126,24 @@ async def mostrar_preview(mensaje, ud: dict) -> int:
         ],
         fila_extras,
     ])
-    linea_detalle = f"Detalle: {ud['descripcion']}\n" if ud.get("descripcion") else ""
+    # Siempre mostramos el detalle efectivo (el propio o el default), asi queda
+    # claro que es lo que va a salir impreso y editable con el boton 📝 Detalle.
+    detalle_efectivo = ud.get("descripcion") or fac.FACTURA_DESCRIPCION
+    es_default = " (default)" if not ud.get("descripcion") else ""
+    linea_detalle = f"Detalle: {detalle_efectivo}{es_default}\n"
+    # Nombre a mostrar en el preview: el tipeado o el guardado (el padrón no se
+    # consulta aca para no demorar cada preview).
+    nombre_prev = ud.get("receptor_nombre")
+    if nombre_prev is None and receptor_identificado:
+        nombre_prev = fac.nombre_de_cliente(ud.get("doc_tipo"), ud.get("doc_nro"))
+    linea_nombre = f"Nombre: {nombre_prev}\n" if nombre_prev else ""
     umbral = fac.aviso_umbral(ud["monto"], ud["doc_tipo"])
     linea_umbral = f"{umbral}\n\n" if umbral else ""
     await mensaje.reply_text(
         f"Vas a emitir:\n\n"
         f"Factura C — {fac.CONCEPTO_DESC}\n"
         f"Receptor: {descripcion_receptor(ud)}\n"
+        f"{linea_nombre}"
         f"Total: ${fmt_ars(ud['monto'])}\n"
         f"{linea_detalle}"
         f"Fecha: {etiqueta_fecha}\n"
@@ -368,6 +385,58 @@ async def recibir_periodo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["serv_desde"], context.user_data["serv_hasta"] = periodo
     return await mostrar_preview(update.message, context.user_data)
+
+
+async def pedir_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    actual = context.user_data.get("descripcion")
+    linea_actual = f"\n\nActual: «{actual}»" if actual else ""
+    await query.edit_message_text(
+        "¿Qué detalle querés que diga la factura? Es el texto del PDF "
+        "(ARCA no lo pide, así que ponés lo que quieras).\n\n"
+        f"Mandámelo — o «default» para usar «{fac.FACTURA_DESCRIPCION}»."
+        f"{linea_actual}"
+    )
+    return PIDIENDO_DESCRIPCION
+
+
+async def recibir_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    if texto.lower() in ("default", "-", "borrar"):
+        context.user_data.pop("descripcion", None)
+    else:
+        context.user_data["descripcion"] = texto
+    return await mostrar_preview(update.message, context.user_data)
+
+
+async def pedir_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ud = context.user_data
+    actual = ud.get("receptor_nombre") or fac.nombre_de_cliente(
+        ud.get("doc_tipo"), ud.get("doc_nro"))
+    linea_actual = f"\n\nActual: «{actual}»" if actual else ""
+    await query.edit_message_text(
+        "¿Nombre o razón social del destinatario? Aparece en el PDF y lo guardo "
+        "para las próximas facturas a este cliente.\n\n"
+        "Mandámelo — o «auto» para volver al guardado / padrón."
+        f"{linea_actual}"
+    )
+    return PIDIENDO_NOMBRE
+
+
+async def recibir_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
+    texto = update.message.text.strip()
+    if texto.lower() in ("auto", "default", "-"):
+        ud.pop("receptor_nombre", None)
+    else:
+        ud["receptor_nombre"] = texto
+        if ud.get("doc_tipo") in (fac.DOC_TIPO_CUIT, fac.DOC_TIPO_DNI):
+            fac.recordar_nombre_cliente(ud["doc_tipo"], ud["doc_nro"],
+                                        ud.get("cond_iva"), texto)
+    return await mostrar_preview(update.message, ud)
 
 
 async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1190,9 +1259,13 @@ def main():
                 CallbackQueryHandler(confirmar, pattern="^(confirmar|cancelar)$"),
                 CallbackQueryHandler(pedir_fecha, pattern="^fecha$"),
                 CallbackQueryHandler(pedir_periodo, pattern="^periodo$"),
+                CallbackQueryHandler(pedir_descripcion, pattern="^detalle$"),
+                CallbackQueryHandler(pedir_nombre, pattern="^nombre$"),
             ],
             PIDIENDO_FECHA: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_fecha)],
             PIDIENDO_PERIODO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_periodo)],
+            PIDIENDO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_descripcion)],
+            PIDIENDO_NOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_nombre)],
             CONFIRMANDO_LOTE: [CallbackQueryHandler(confirmar_lote, pattern="^(confirmar|cancelar)$")],
             CONFIRMANDO_NC: [CallbackQueryHandler(confirmar_nc, pattern="^(confirmar|cancelar)$")],
         },
