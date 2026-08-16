@@ -1,0 +1,68 @@
+# Stack completo para correr el bot con la DB LOCAL (sin Supabase cloud).
+#
+#   db        -> Postgres 17 con el schema aplicado al primer arranque
+#   postgrest -> expone las tablas con la misma API REST que usa supabase-py
+#   gateway   -> nginx que traduce /rest/v1/* -> postgrest (red interna, nada
+#                expuesto a la LAN)
+#   bot       -> el bot, apuntado al gateway en vez de a supabase.co
+#
+# Variables que espera en el .env (ademas de las del bot):
+#   DB_PASSWORD  -> password de Postgres (inventa una)
+#   CERTS_DIR    -> carpeta del host con cert/key de ARCA (ej /home/pi/.arca-facturador)
+#                   En modo homologacion (PRODUCTION=false) alcanza con que exista.
+#
+# OJO: AFIP_CERT_PATH / AFIP_KEY_PATH en el .env tienen que ser rutas DENTRO
+# del container, o sea /certs/<archivo>.
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: facturador
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      AUTHENTICATOR_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema_facturacion.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./deploy/initdb/02_roles.sh:/docker-entrypoint-initdb.d/02_roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d facturador"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgrest:
+    image: postgrest/postgrest:v12.2.3
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${DB_PASSWORD}@db:5432/facturador
+      PGRST_DB_ANON_ROLE: facturador
+      PGRST_DB_SCHEMAS: public
+    depends_on:
+      db:
+        condition: service_healthy
+
+  gateway:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - postgrest
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Pisan lo que diga el .env: la "Supabase" ahora es el stack local.
+      SUPABASE_URL: http://gateway
+      SUPABASE_SECRET_KEY: local
+    volumes:
+      - ${CERTS_DIR}:/certs:ro
+    depends_on:
+      - gateway
+
+volumes:
+  pgdata:
