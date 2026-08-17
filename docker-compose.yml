@@ -36,7 +36,9 @@ services:
     image: postgrest/postgrest:v12.2.3
     restart: unless-stopped
     environment:
-      PGRST_DB_URI: postgres://authenticator:${DB_PASSWORD}@db:5432/facturador
+      # Formato clave-valor: no se rompe si la password tiene caracteres
+      # especiales (el formato URL si). Evitar igual comillas y espacios.
+      PGRST_DB_URI: host=db port=5432 dbname=facturador user=authenticator password=${DB_PASSWORD}
       PGRST_DB_ANON_ROLE: facturador
       PGRST_DB_SCHEMAS: public
     depends_on:
